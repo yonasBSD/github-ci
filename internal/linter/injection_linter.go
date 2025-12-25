@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/reugn/github-ci/internal/stringutil"
 	"github.com/reugn/github-ci/internal/workflow"
@@ -48,17 +49,30 @@ var dangerousContexts = []string{
 
 // dangerousPatterns contains compiled regex patterns for detecting dangerous contexts.
 // Patterns support both exact matches and wildcards.
-var dangerousPatterns []*regexp.Regexp
+var (
+	dangerousPatterns []*regexp.Regexp
+	patternsOnce      sync.Once
+)
 
-func init() {
-	dangerousPatterns = make([]*regexp.Regexp, 0, len(dangerousContexts))
-	for _, ctx := range dangerousContexts {
-		// Convert wildcard patterns to regex
-		pattern := regexp.QuoteMeta(ctx)
-		pattern = strings.ReplaceAll(pattern, `\*`, `[^}]+`)
-		re := regexp.MustCompile(`\$\{\{\s*` + pattern + `\s*\}\}`)
-		dangerousPatterns = append(dangerousPatterns, re)
-	}
+// stepConfigKeys lists YAML keys that indicate step configuration rather than run content.
+var stepConfigKeys = []string{
+	"env:", "name:", "with:", "if:", "id:", "uses:",
+	"continue-on-error:", "timeout-minutes:", "working-directory:",
+	"shell:",
+}
+
+// initPatterns compiles dangerous context patterns once.
+func initPatterns() {
+	patternsOnce.Do(func() {
+		dangerousPatterns = make([]*regexp.Regexp, 0, len(dangerousContexts))
+		for _, ctx := range dangerousContexts {
+			// Convert wildcard patterns to regex
+			pattern := regexp.QuoteMeta(ctx)
+			pattern = strings.ReplaceAll(pattern, `\*`, `[^}]+`)
+			re := regexp.MustCompile(`\$\{\{\s*` + pattern + `\s*\}\}`)
+			dangerousPatterns = append(dangerousPatterns, re)
+		}
+	})
 }
 
 // InjectionLinter checks for shell injection vulnerabilities in workflow files.
@@ -68,12 +82,8 @@ type InjectionLinter struct{}
 
 // NewInjectionLinter creates a new InjectionLinter instance.
 func NewInjectionLinter() *InjectionLinter {
+	initPatterns()
 	return &InjectionLinter{}
-}
-
-// LintWorkflow checks a single workflow for shell injection vulnerabilities.
-func (l *InjectionLinter) LintWorkflow(wf *workflow.Workflow) ([]*Issue, error) {
-	return l.lintWorkflow(wf), nil
 }
 
 // lineContext tracks the parsing state while scanning workflow lines.
@@ -84,8 +94,8 @@ type lineContext struct {
 	envBlockIndent int
 }
 
-// lintWorkflow checks a single workflow for injection vulnerabilities.
-func (l *InjectionLinter) lintWorkflow(wf *workflow.Workflow) []*Issue {
+// LintWorkflow checks a single workflow for injection vulnerabilities.
+func (l *InjectionLinter) LintWorkflow(wf *workflow.Workflow) ([]*Issue, error) {
 	var issues []*Issue
 	file := filepath.Base(wf.File)
 	lines := wf.Lines()
@@ -97,7 +107,7 @@ func (l *InjectionLinter) lintWorkflow(wf *workflow.Workflow) []*Issue {
 		}
 	}
 
-	return issues
+	return issues, nil
 }
 
 // processLine processes a single line and returns an issue if found.
@@ -167,12 +177,7 @@ func isStepBoundary(trimmed string) bool {
 
 // isStepConfigKey checks if a line is a step configuration key (not run content).
 func isStepConfigKey(trimmed string) bool {
-	configKeys := []string{
-		"env:", "name:", "with:", "if:", "id:", "uses:",
-		"continue-on-error:", "timeout-minutes:", "working-directory:",
-		"shell:",
-	}
-	for _, key := range configKeys {
+	for _, key := range stepConfigKeys {
 		if strings.HasPrefix(trimmed, key) {
 			return true
 		}
